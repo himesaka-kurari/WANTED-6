@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>WANTED 6 - 15分逃げ切れ</title>
+<style>
+  html,body{margin:0;height:100%;background:#111;overflow:hidden;overscroll-behavior:none;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+  canvas{display:block;cursor:crosshair;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* ========== 設定 ========== */
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W, H;
+function resize(){ W = cv.width = innerWidth; H = cv.height = innerHeight; }
+resize(); addEventListener('resize', resize);
+
+const WORLD = 3200, BLOCK = 400, ROAD = 120;   // マップ(2D平面)
+const GOAL = 900;                               // 15分 = 900秒
+const STAR_AT = [0, 120, 300, 480, 660, 810];   // 各手配度に上がる秒数
+
+// GTA SA準拠: ★1 警官(警棒/Colt45)・白バイ → ★2 全員銃 → ★3 ショットガン+道路封鎖 → ★4 SWAT+ヘリ → ★5 FBI → ★6 軍隊(装甲車・ライノ)
+const TYPES = {
+  baton:  { hp:40,  sp:2.4, dmg:5,  rate:700,  range:26,  r:13, col:'#93c5fd', xp:8,  melee:true },       // 警棒・逮捕を試みる
+  cop:    { hp:40,  sp:2.3, dmg:6,  rate:900,  range:230, r:13, col:'#3b82f6', xp:10 },                  // 拳銃(Colt45)
+  biker:  { hp:35,  sp:4.3, dmg:6,  rate:800,  range:220, r:11, col:'#1d4ed8', xp:14 },                  // 白バイ
+  shotgun:{ hp:55,  sp:2.3, dmg:4,  rate:1300, range:190, r:13, col:'#1e3a8a', xp:20, pellets:5, spread:.35 },
+  swat:   { hp:120, sp:2.4, dmg:11, rate:420,  range:280, r:14, col:'#111827', xp:30 },
+  heli:   { hp:320, sp:2.6, dmg:5,  rate:200,  range:330, r:20, col:'#9ca3af', xp:120, fly:true },       // 警察ヘリ(建物の上を飛ぶ)
+  fbi:    { hp:80,  sp:2.7, dmg:10, rate:600,  range:270, r:13, col:'#475569', xp:22 },
+  army:   { hp:170, sp:2.5, dmg:14, rate:380,  range:320, r:14, col:'#65813b', xp:45 },
+  apc:    { hp:450, sp:2.1, dmg:9,  rate:200,  range:360, r:22, col:'#5b6b3a', xp:90,  big:true },       // 装甲車
+  tank:   { hp:800, sp:1.2, dmg:38, rate:2300, range:520, r:28, col:'#4d5a2a', xp:200, splash:80, big:true } // ライノ
+};
+const LIMIT = { heli:2, apc:3, tank:3 };   // 同時出現の上限
+const SPAWN = {                            // 手配度ごとの出現テーブル [種類, 重み]
+  1: [['baton',4],['cop',4],['biker',2]],
+  2: [['cop',6],['biker',4]],
+  3: [['shotgun',5],['cop',3],['biker',2]],
+  4: [['swat',5],['shotgun',2],['heli',2]],
+  5: [['fbi',6],['swat',2],['heli',1],['shotgun',1]],
+  6: [['army',4],['apc',2],['tank',2],['fbi',1],['heli',1]]
+};
+// 味方(複数パターン・複数人OK)
+const ALLY = {
+  gunner: { hp:70,  rate:480,  dmg:9,  range:300, pel:1, spr:.06, col:'#34d399' },
+  sniper: { hp:50,  rate:1500, dmg:45, range:560, pel:1, spr:.01, col:'#a78bfa', spd:3.2 },
+  shotgun:{ hp:110, rate:1000, dmg:7,  range:200, pel:5, spr:.35, col:'#fb923c' },
+  medic:  { hp:60,  heal:true, col:'#f9a8d4' }
+};
+// 手配度(w)が上がるほど味方も強くなる (★6でHP約4.5倍 / 火力3倍 / 連射1.6倍)
+const allyHp   = w => 1+(w-1)*0.7;
+const allyDmg  = w => 1+(w-1)*0.4;
+const allyRate = w => 1+(w-1)*0.12;
+const UPG = {
+  atk:    { t:'攻撃力UP', d:'与ダメージ +20%\n(味方にも反映)' },
+  rate:   { t:'連射力UP', d:'発射間隔 -12%' },
+  spd:    { t:'移動速度UP', d:'移動速度 +10%' },
+  gunner: { t:'味方: 護衛兵', d:'ピストルで常に援護\n連射が速い' },
+  sniper: { t:'味方: スナイパー', d:'超長射程・高威力\n連射は遅い' },
+  shotgun:{ t:'味方: ショットガン兵', d:'近距離で高火力\nHPが高い' },
+  medic:  { t:'味方: 衛生兵', d:'定期的にHPを回復\n攻撃はしない' }
+};
+
+/* ========== 状態 ========== */
+let state = 'title';           // title / play / dead / clear
+let allies, items, picks, need, rbCd, choices, t, p, enemies, bullets, pickups, fx, texts, buildings, parks, kills, last, spawnCd;
+const keys = {}; const mouse = { x:0, y:0, down:false };
+const cam = { x:0, y:0 };
+
+const rnd = (a,b)=>a+Math.random()*(b-a);
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+
+function genMap(){
+  buildings = []; parks = [];
+  for(let bx=0; bx<WORLD/BLOCK; bx++) for(let by=0; by<WORLD/BLOCK; by++){
+    const x = bx*BLOCK+ROAD/2, y = by*BLOCK+ROAD/2, s = BLOCK-ROAD;
+    if(Math.abs(bx-4)<=0 && Math.abs(by-4)<=0 || Math.random()<0.22){ parks.push({x,y,w:s,h:s}); continue; }
+    // 1ブロックに1〜2棟(路地ができる)
+    if(Math.random()<0.5) buildings.push({x:x+rnd(0,30),y:y+rnd(0,30),w:s-rnd(40,90),h:s-rnd(40,90),c:Math.floor(rnd(60,100))});
+    else { const h=s/2-12; buildings.push({x,y,w:s,h:h,c:Math.floor(rnd(60,100))},{x,y:y+h+24,w:s,h:h,c:Math.floor(rnd(60,100))}); }
+  }
+}
+
+function start(){
+  genMap();
+  t = 0; kills = 0; spawnCd = 0;
+  enemies = []; bullets = []; pickups = []; fx = []; texts = [];
+  allies = []; items = 0; picks = 0; need = 3; rbCd = 0; choices = [];
+  p = { x:WORLD/2, y:WORLD/2, r:13, hp:100, maxHp:100, armor:0, lvl:1, xp:0, next:40, spd:3.2, arrest:0,
+        dmg:18, rate:200, cd:0, dash:0, dashCd:0, ang:0, hit:0 };
+  state = 'play'; last = performance.now(); TS.l=TS.r=null; TS.dashId=null;
+}
+
+const wanted = () => { let w=1; for(let i=0;i<6;i++) if(t>=STAR_AT[i]) w=i+1; return w; };
+
+/* ========== 衝突 ========== */
+function inBuilding(x,y){ return buildings.some(b=>x>b.x&&x<b.x+b.w&&y>b.y&&y<b.y+b.h); }
+function pushOut(e){
+  for(const b of buildings){
+    const cx=clamp(e.x,b.x,b.x+b.w), cy=clamp(e.y,b.y,b.y+b.h);
+    let dx=e.x-cx, dy=e.y-cy, d=Math.hypot(dx,dy);
+    if(d<e.r){
+      if(d===0){ e.y=b.y-e.r; continue; }
+      e.x+=dx/d*(e.r-d); e.y+=dy/d*(e.r-d);
+    }
+  }
+  e.x=clamp(e.x,e.r,WORLD-e.r); e.y=clamp(e.y,e.r,WORLD-e.r);
+}
+
+/* ========== ダメージ・演出 ========== */
+function hurt(d){
+  if(p.dash>0) return;
+  const a=Math.min(p.armor,d); p.armor-=a; d-=a; p.hp-=d; p.hit=8;
+}
+function explode(x,y,rad,dmg){
+  fx.push({x,y,r:0,max:rad,life:18});
+  if(Math.hypot(p.x-x,p.y-y)<rad+p.r) hurt(dmg);
+  allies.forEach(a=>{ if(Math.hypot(a.x-x,a.y-y)<rad+a.r) a.hp-=dmg; });
+}
+function popText(x,y,s,c='#fff'){ texts.push({x,y,s,c,life:60}); }
+
+function gainXp(v){
+  p.xp+=v;
+  while(p.xp>=p.next){
+    p.xp-=p.next; p.lvl++; p.next=Math.floor(p.next*1.35+10);
+    p.maxHp+=10; p.hp=Math.min(p.maxHp,p.hp+30);
+    popText(p.x,p.y-30,'LEVEL UP! Lv'+p.lvl,'#fde047');
+  }
+}
+
+/* ========== 敵 ========== */
+function pickType(w){
+  const tb=SPAWN[w]; let sum=0; tb.forEach(e=>sum+=e[1]);
+  let r=Math.random()*sum;
+  for(const [k,wt] of tb){ if((r-=wt)<=0){ if(LIMIT[k]&&enemies.filter(e=>e.type===k).length>=LIMIT[k]) return tb[0][0]; return k; } }
+  return tb[0][0];
+}
+function mk(type,x,y){ const T=TYPES[type]; return {type,x,y,r:T.r,hp:T.hp,max:T.hp,cd:rnd(300,T.rate),ang:0,strafe:Math.random()<.5?1:-1}; }
+// ★3以降: 道路封鎖(パトカーで道を塞ぎ、ショットガン警官が待ち構える)
+function roadblock(){
+  const a=rnd(0,Math.PI*2), d=rnd(550,800);
+  const x=clamp(p.x+Math.cos(a)*d,150,WORLD-150), y=clamp(p.y+Math.sin(a)*d,150,WORLD-150);
+  const v=Math.random()<.5; let cx=x, cy=y, pcs;
+  if(v){ cx=Math.round(x/BLOCK)*BLOCK; pcs=[[cx-60,cy-13,40,26],[cx+20,cy-13,40,26]]; }
+  else { cy=Math.round(y/BLOCK)*BLOCK; pcs=[[cx-13,cy-60,26,40],[cx-13,cy+20,26,40]]; }
+  if(Math.hypot(cx-p.x,cy-p.y)<450 || inBuilding(cx,cy)) return;
+  pcs.forEach(q=>buildings.push({x:q[0],y:q[1],w:q[2],h:q[3],rb:true,life:2400}));
+  for(let i=0;i<2;i++) enemies.push(mk('shotgun', v?cx+(i?30:-30):cx+40, v?cy+40:cy+(i?30:-30)));
+}
+function spawn(w){
+  for(let i=0;i<12;i++){
+    const a=rnd(0,Math.PI*2), d=Math.hypot(W,H)/2+60;
+    const x=p.x+Math.cos(a)*d, y=p.y+Math.sin(a)*d;
+    if(x<30||y<30||x>WORLD-30||y>WORLD-30||inBuilding(x,y)) continue;
+    const type=pickType(w), T=TYPES[type];
+    enemies.push(mk(type,x,y));
+    return;
+  }
+}
+function updateEnemies(dt,k,w){
+  let arrest=false;
+  for(const e of enemies){
+    const T=TYPES[e.type];
+    const dx=p.x-e.x, dy=p.y-e.y, d=Math.hypot(dx,dy)||1;
+    e.ang=Math.atan2(dy,dx);
+    let mx=0,my=0;
+    if(T.melee || d>T.range*0.7){ mx=dx/d; my=dy/d; }               // 近づく
+    else { mx=-dy/d*e.strafe*0.6; my=dx/d*e.strafe*0.6; }            // 回り込む
+    if(!T.melee && d<120){ mx-=dx/d*0.8; my-=dy/d*0.8; }             // 近すぎたら離れる
+    const ox=e.x, oy=e.y;
+    e.x+=mx*T.sp*k; e.y+=my*T.sp*k;
+    if(T.fly){ e.x=clamp(e.x,e.r,WORLD-e.r); e.y=clamp(e.y,e.r,WORLD-e.r); } else pushOut(e);
+    if(Math.hypot(e.x-ox,e.y-oy)<T.sp*k*0.3 && Math.random()<.02) e.strafe*=-1;
+    e.cd-=dt;
+    if(T.melee){                                                     // 警棒: 殴る＋逮捕ゲージ
+      if(d<e.r+p.r+8){ arrest=true; if(e.cd<=0){ e.cd=T.rate; hurt(T.dmg); } }
+    } else if(e.cd<=0 && d<T.range){
+      e.cd=T.rate*rnd(.9,1.2);
+      const n=T.pellets||1, sp=e.type==='tank'?7:9, spr=T.spread||.09;
+      for(let i=0;i<n;i++){
+        const a=e.ang+rnd(-spr,spr);
+        bullets.push({x:e.x,y:e.y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,dmg:T.dmg*(1+w*0.04),life:Math.ceil(T.range*1.2/sp),enemy:true,splash:T.splash,air:T.fly});
+      }
+    }
+  }
+  if(p.dash>0) arrest=false;
+  p.arrest=clamp(p.arrest+(arrest?1.1*k:-0.6*k),0,100);
+  if(p.arrest>=100) state='dead';
+  enemies=enemies.filter(e=>Math.hypot(e.x-p.x,e.y-p.y)<1400);
+}
+// 味方AI: プレイヤーの周囲を護衛しつつ、近い敵を自動で撃つ
+function updateAllies(dt,k){
+  const w=wanted();
+  allies.forEach((a,i)=>{
+    const A=ALLY[a.kind];
+    if(a.w!==w){ // 手配度が変わったら耐久力を引き上げ、少し回復
+      const nm=Math.round(A.hp*allyHp(w));
+      a.hp=a.w ? Math.min(nm,a.hp/a.max*nm+nm*.3) : nm; a.max=nm; a.w=w;
+    }
+    if(Math.hypot(p.x-a.x,p.y-a.y)>700){ a.x=p.x; a.y=p.y; }
+    const ang=i*2.4+t*0.5, off=45+(i%3)*18;
+    const tx=p.x+Math.cos(ang)*off, ty=p.y+Math.sin(ang)*off;
+    const dx=tx-a.x, dy=ty-a.y, d=Math.hypot(dx,dy);
+    if(d>6){ const s=Math.min(d,(A.spd||3.6)*k*(d>120?1.6:1)); a.x+=dx/d*s; a.y+=dy/d*s; }
+    pushOut(a); a.cd-=dt;
+    if(A.heal){ if(a.cd<=0){ a.cd=1200; allies.forEach(o=>{ if(o!==a&&Math.hypot(o.x-a.x,o.y-a.y)<180) o.hp=Math.min(o.max,o.hp+o.max*.05); }); if(p.hp<p.maxHp&&Math.hypot(a.x-p.x,a.y-p.y)<200){ p.hp=Math.min(p.maxHp,p.hp+4+(w-1)*2); popText(p.x,p.y-24,'+','#f9a8d4'); } } return; }
+    let tg=null, bd=A.range;
+    for(const e of enemies){ const dd=Math.hypot(e.x-a.x,e.y-a.y); if(dd<bd){ bd=dd; tg=e; } }
+    if(tg){
+      a.ang=Math.atan2(tg.y-a.y,tg.x-a.x);
+      if(a.cd<=0){ a.cd=A.rate/allyRate(w);
+        for(let j=0;j<A.pel;j++){ const q=a.ang+rnd(-A.spr,A.spr);
+          bullets.push({x:a.x,y:a.y,vx:Math.cos(q)*12,vy:Math.sin(q)*12,dmg:A.dmg*(p.dmg/18)*allyDmg(w),life:Math.ceil(A.range*1.2/12),enemy:false}); } }
+    }
+  });
+  allies=allies.filter(a=>a.hp>0);
+}
+// 強化3択
+function openPick(){
+  items=0; picks++; need=3+Math.floor(picks/3);
+  choices=['atk','rate','spd','gunner','sniper','shotgun','medic'].sort(()=>Math.random()-.5).slice(0,3);
+  state='pick'; pickT=performance.now();
+}
+function applyPick(id){
+  if(id==='atk') p.dmg*=1.2;
+  else if(id==='rate') p.rate=Math.max(60,p.rate*.88);
+  else if(id==='spd') p.spd*=1.1;
+  else if(allies.length<12) allies.push({kind:id,x:p.x,y:p.y,r:11,hp:ALLY[id].hp,max:ALLY[id].hp,w:0,cd:rnd(0,500),ang:0});
+  else p.hp=p.maxHp;
+  state='play'; last=performance.now(); mouse.down=false;
+}
+
+/* ========== 更新 ========== */
+function update(dt){
+  const k=dt/16.67; t+=dt/1000;
+  const w=wanted();
+
+  // 移動(上下左右)
+  let ix=(keys.d||keys.arrowright?1:0)-(keys.a||keys.arrowleft?1:0);
+  let iy=(keys.s||keys.arrowdown?1:0)-(keys.w||keys.arrowup?1:0);
+  const lv=stickVec(TS.l); if(lv&&lv.m>.2){ ix=lv.x; iy=lv.y; }
+  const il=Math.hypot(ix,iy)||1;
+  let sp=p.spd;
+  if(p.dash>0){ sp=9; p.dash-=dt; }
+  if(p.dashCd>0) p.dashCd-=dt;
+  if((keys[' ']||TS.dashId!==null) && p.dashCd<=0 && (ix||iy)){ p.dash=180; p.dashCd=2200; }
+  p.x+=ix/il*sp*k; p.y+=iy/il*sp*k; pushOut(p);
+
+  // 射撃
+  const rv=stickVec(TS.r), fire=!!(rv&&rv.m>.25);
+  if(fire) p.ang=Math.atan2(rv.y,rv.x); else if(!touchMode) p.ang=Math.atan2(mouse.y+cam.y-p.y, mouse.x+cam.x-p.x);
+  p.cd-=dt;
+  if((mouse.down||fire) && p.cd<=0){
+    p.cd=p.rate; const a=p.ang+rnd(-.04,.04);
+    bullets.push({x:p.x,y:p.y,vx:Math.cos(a)*13,vy:Math.sin(a)*13,dmg:p.dmg,life:60,enemy:false});
+  }
+  if(p.hit>0) p.hit--;
+  updateAllies(dt,k);
+
+  // 敵スポーン (手配度が上がるほど数・頻度が増える)
+  spawnCd-=dt;
+  if(enemies.length<5+w*5 && spawnCd<=0){ spawn(w); spawnCd=950-w*120; }
+  rbCd-=dt; if(w>=3 && rbCd<=0){ roadblock(); rbCd=25000; }
+  buildings.forEach(b=>{ if(b.rb) b.life-=k; }); buildings=buildings.filter(b=>!b.rb||b.life>0);
+  updateEnemies(dt,k,w);
+
+  // 弾
+  for(const b of bullets){
+    b.x+=b.vx*k; b.y+=b.vy*k; b.life-=k;
+    if((!b.air&&inBuilding(b.x,b.y))||b.x<0||b.y<0||b.x>WORLD||b.y>WORLD){ b.life=0; }
+    else if(b.enemy){
+      if(Math.hypot(b.x-p.x,b.y-p.y)<p.r+3){ b.life=0; if(!b.splash) hurt(b.dmg); }
+      else for(const a of allies){ if(Math.hypot(b.x-a.x,b.y-a.y)<a.r+3){ b.life=0; if(!b.splash) a.hp-=b.dmg; break; } }
+    } else {
+      for(const e of enemies){
+        if(Math.hypot(b.x-e.x,b.y-e.y)<e.r+3){ e.hp-=b.dmg; b.life=0; fx.push({x:b.x,y:b.y,r:2,max:8,life:6}); break; }
+      }
+    }
+    if(b.life<=0 && b.splash) explode(b.x,b.y,b.splash,b.dmg);
+  }
+  bullets=bullets.filter(b=>b.life>0);
+
+  // 撃破 → 経験値・ドロップ
+  for(const e of enemies) if(e.hp<=0){
+    kills++; gainXp(TYPES[e.type].xp);
+    fx.push({x:e.x,y:e.y,r:4,max:e.type==='tank'?60:22,life:14});
+    const r=Math.random();
+    if(r<.2) pickups.push({x:e.x,y:e.y,kind:'hp',life:900});
+    else if(r<.4) pickups.push({x:e.x,y:e.y,kind:'armor',life:900});
+  }
+  enemies=enemies.filter(e=>e.hp>0);
+
+  // ピックアップ
+  for(const q of pickups){
+    q.life-=k;
+    if(Math.hypot(q.x-p.x,q.y-p.y)<p.r+14){
+      q.life=0;
+      if(q.kind==='hp'){ p.hp=Math.min(p.maxHp,p.hp+35); popText(p.x,p.y-24,'+HP','#f87171'); }
+      else { p.armor=Math.min(100,p.armor+40); popText(p.x,p.y-24,'+ARMOR','#60a5fa'); }
+      if(++items>=need && state==='play') openPick();
+    }
+  }
+  pickups=pickups.filter(q=>q.life>0);
+
+  fx.forEach(f=>{ f.life-=k; f.r+=(f.max-f.r)*.25*k; }); fx=fx.filter(f=>f.life>0);
+  texts.forEach(s=>{ s.life-=k; s.y-=.5*k; }); texts=texts.filter(s=>s.life>0);
+
+  if(p.hp<=0) state='dead';
+  else if(t>=GOAL) state='clear';
+}
+
+/* ========== 描画 ========== */
+function draw(){
+  cam.x=clamp(p.x-W/2,0,Math.max(0,WORLD-W)); cam.y=clamp(p.y-H/2,0,Math.max(0,WORLD-H));
+  ctx.fillStyle='#2b2d31'; ctx.fillRect(0,0,W,H);
+  ctx.save(); ctx.translate(-cam.x,-cam.y);
+
+  // 道路のセンターライン
+  ctx.strokeStyle='#6b6f76'; ctx.lineWidth=3; ctx.setLineDash([24,24]);
+  for(let i=0;i<=WORLD/BLOCK;i++){
+    ctx.beginPath(); ctx.moveTo(i*BLOCK,0); ctx.lineTo(i*BLOCK,WORLD); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0,i*BLOCK); ctx.lineTo(WORLD,i*BLOCK); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.fillStyle='#2f5d34'; parks.forEach(b=>ctx.fillRect(b.x,b.y,b.w,b.h));
+  buildings.forEach(b=>{ ctx.fillStyle=b.rb?(t%0.6<0.3?'#60a5fa':'#f87171'):`rgb(${b.c},${b.c+4},${b.c+10})`; ctx.fillRect(b.x,b.y,b.w,b.h);
+    ctx.strokeStyle='#111'; ctx.lineWidth=3; ctx.strokeRect(b.x,b.y,b.w,b.h); });
+  ctx.strokeStyle='#f43f5e'; ctx.lineWidth=6; ctx.strokeRect(0,0,WORLD,WORLD);
+
+  pickups.forEach(q=>{
+    ctx.fillStyle=q.kind==='hp'?'#ef4444':'#3b82f6';
+    ctx.fillRect(q.x-9,q.y-9,18,18); ctx.fillStyle='#fff';
+    ctx.fillRect(q.x-5,q.y-1.5,10,3); if(q.kind==='hp') ctx.fillRect(q.x-1.5,q.y-5,3,10);
+  });
+
+  for(const e of enemies){
+    const T=TYPES[e.type];
+    ctx.save(); ctx.translate(e.x,e.y); ctx.rotate(e.ang);
+    ctx.fillStyle=T.col; ctx.strokeStyle='#000'; ctx.lineWidth=2;
+    if(T.big){ ctx.fillRect(-e.r,-e.r*.8,e.r*2,e.r*1.6); ctx.strokeRect(-e.r,-e.r*.8,e.r*2,e.r*1.6);
+      ctx.fillStyle='#3b4520'; ctx.beginPath(); ctx.arc(0,0,e.r*.55,0,7); ctx.fill(); ctx.fillRect(0,-3,e.r*1.4,6); }
+    else if(T.fly){ ctx.beginPath(); ctx.arc(0,0,e.r,0,7); ctx.fill(); ctx.stroke(); ctx.rotate(-e.ang+t*18); ctx.strokeStyle='#e5e7eb'; ctx.lineWidth=4; ctx.beginPath(); ctx.moveTo(-e.r*1.8,0); ctx.lineTo(e.r*1.8,0); ctx.moveTo(0,-e.r*1.8); ctx.lineTo(0,e.r*1.8); ctx.stroke(); }
+    else { ctx.beginPath(); ctx.arc(0,0,e.r,0,7); ctx.fill(); ctx.stroke(); ctx.fillStyle='#ddd'; ctx.fillRect(4,-2,e.r+6,4); }
+    ctx.restore();
+    ctx.fillStyle='#000'; ctx.fillRect(e.x-e.r,e.y-e.r-10,e.r*2,4);
+    ctx.fillStyle='#ef4444'; ctx.fillRect(e.x-e.r,e.y-e.r-10,e.r*2*e.hp/e.max,4);
+  }
+
+  for(const a of allies){
+    const A=ALLY[a.kind]; ctx.fillStyle=A.col; ctx.strokeStyle='#000'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(a.x,a.y,a.r,0,7); ctx.fill(); ctx.stroke();
+    if(!A.heal){ ctx.save(); ctx.translate(a.x,a.y); ctx.rotate(a.ang); ctx.fillStyle='#eee'; ctx.fillRect(3,-2,a.r+6,4); ctx.restore(); }
+    else { ctx.fillStyle='#fff'; ctx.fillRect(a.x-5,a.y-1.5,10,3); ctx.fillRect(a.x-1.5,a.y-5,3,10); }
+    ctx.fillStyle='#000'; ctx.fillRect(a.x-10,a.y-a.r-8,20,3); ctx.fillStyle='#4ade80'; ctx.fillRect(a.x-10,a.y-a.r-8,20*a.hp/a.max,3);
+  }
+  // プレイヤー
+  ctx.save(); ctx.translate(p.x,p.y); ctx.rotate(p.ang);
+  ctx.globalAlpha=p.dash>0?.45:1;
+  ctx.fillStyle=p.hit>0?'#fff':'#f59e0b'; ctx.strokeStyle='#000'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.arc(0,0,p.r,0,7); ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#eee'; ctx.fillRect(4,-2,p.r+8,4); ctx.restore();
+
+  bullets.forEach(b=>{ ctx.fillStyle=b.enemy?(b.splash?'#fb923c':'#f87171'):'#fde047';
+    ctx.beginPath(); ctx.arc(b.x,b.y,b.splash?6:3,0,7); ctx.fill(); });
+  fx.forEach(f=>{ ctx.fillStyle=`rgba(251,146,60,${clamp(f.life/14,0,1)})`; ctx.beginPath(); ctx.arc(f.x,f.y,f.r,0,7); ctx.fill(); });
+  ctx.font='bold 14px sans-serif'; ctx.textAlign='center';
+  texts.forEach(s=>{ ctx.fillStyle=s.c; ctx.fillText(s.s,s.x,s.y); });
+  ctx.restore();
+  hud();
+  if(isTouch) drawTouchUI();
+}
+
+function bar(x,y,w,h,v,c){ ctx.fillStyle='#0008'; ctx.fillRect(x,y,w,h); ctx.fillStyle=c; ctx.fillRect(x,y,w*clamp(v,0,1),h); ctx.strokeStyle='#000'; ctx.strokeRect(x,y,w,h); }
+function hud(){
+  const w=wanted(), rem=Math.max(0,GOAL-t), m=Math.floor(rem/60), s=Math.floor(rem%60);
+  ctx.textAlign='left'; ctx.font='bold 28px sans-serif';
+  for(let i=0;i<6;i++){ ctx.fillStyle=i<w?(t%1<.5&&i<w?'#facc15':'#fde047'):'#555'; ctx.fillText('★',16+i*30,40); }
+  ctx.font='bold 16px sans-serif'; ctx.fillStyle='#fff';
+  const names=['','警官・白バイ(警棒/拳銃)','全員が銃を使用','ショットガン警官+道路封鎖','SWAT+警察ヘリ','FBI出動','軍隊(装甲車・ライノ)'];
+  ctx.fillText('手配度 '+w+'：'+names[w],16,64);
+  ctx.fillText(`残り ${m}:${String(s).padStart(2,'0')}`,16,88);
+  bar(16,100,200,14,p.hp/p.maxHp,'#ef4444'); bar(16,118,200,10,p.armor/100,'#3b82f6');
+  bar(16,132,200,8,p.xp/p.next,'#a3e635');
+  ctx.font='13px sans-serif'; ctx.fillText(`Lv${p.lvl}  HP ${Math.ceil(p.hp)}/${p.maxHp}  撃破 ${kills}`,16,158);
+  ctx.fillText((touchMode?'ダッシュボタン(無敵)':'Space: ダッシュ(無敵)')+(p.dashCd>0?' …'+(p.dashCd/1000).toFixed(1)+'s':' READY'),16,176);
+  ctx.fillText(`アイテム ${items}/${need}   味方 ${allies.length}人(強化×${allyHp(w).toFixed(1)})`,16,194);
+  if(p.arrest>1){ bar(W/2-100,H-40,200,14,p.arrest/100,'#38bdf8'); ctx.textAlign='center'; ctx.fillStyle='#fff'; ctx.fillText('逮捕されそう！ダッシュで振り切れ',W/2,H-48); ctx.textAlign='left'; }
+  // 進行バー
+  bar(W/2-150,12,300,8,t/GOAL,'#facc15');
+}
+function cardRect(i){ const w=Math.min(250,(W-80)/3), h=190, g=20, x0=W/2-(w*3+g*2)/2; return {x:x0+i*(w+g),y:H/2-h/2+20,w,h}; }
+function drawPick(){
+  ctx.fillStyle='#000b'; ctx.fillRect(0,0,W,H);
+  const hd='強化を選べ！ (1/2/3キー・クリック・タップ)';
+  ctx.textAlign='center'; ctx.fillStyle='#fde047'; fit(hd,W-30,30,true); ctx.fillText(hd,W/2,H/2-110);
+  choices.forEach((id,i)=>{
+    const c=cardRect(i), A=ALLY[id], u=UPG[id];
+    ctx.fillStyle='#1f2937'; ctx.fillRect(c.x,c.y,c.w,c.h); ctx.strokeStyle=A?A.col:'#facc15'; ctx.lineWidth=3; ctx.strokeRect(c.x,c.y,c.w,c.h);
+    ctx.fillStyle='#fff'; const ti=(i+1)+'. '+u.t; fit(ti,c.w-14,19,true); ctx.fillText(ti,c.x+c.w/2,c.y+50);
+    ctx.fillStyle='#d1d5db';
+    u.d.split('\n').forEach((l,j)=>{ fit(l,c.w-14,14,false); ctx.fillText(l,c.x+c.w/2,c.y+90+j*22); });
+  });
+}
+function fit(txt,maxW,size,bold){ let fs=size; do{ ctx.font=(bold?'bold ':'')+fs+'px sans-serif'; fs--; } while(ctx.measureText(txt).width>maxW && fs>9); }
+function overlay(title,sub,col){
+  ctx.fillStyle='#000b'; ctx.fillRect(0,0,W,H);
+  const ty=H<500?H*.22:H/2-30;
+  ctx.textAlign='center'; ctx.fillStyle=col; fit(title,W-40,54,true); ctx.fillText(title,W/2,ty);
+  ctx.fillStyle='#fff';
+  sub.split('\n').forEach((l,i)=>{ fit(l,W-30,18,false); ctx.fillText(l,W/2,ty+40+i*28); });
+}
+
+/* ========== ループ ========== */
+function loop(now){
+  const dt=Math.min(50,now-last); last=now;
+  if(state!==prevState){ prevState=state; stT=now; }
+  if(state==='play') update(dt);
+  if(state==='title'){ ctx.fillStyle='#1c1d20'; ctx.fillRect(0,0,W,H);
+    overlay('WANTED 6','15分間逃げ切れ。手配度は ★1 → ★6 まで上がり続ける。\nWASD/矢印: 移動   マウス: 照準・射撃   Space: ダッシュ\n📱 左スティック: 移動  右スティック: 照準+射撃  DASHボタン: ダッシュ(横向き推奨)\nアイテムを3個拾うごとに強化を3択(攻撃・連射・速度・味方追加)\n\nEnter / クリック / タップで開始','#facc15'); }
+  else{
+    draw();
+    if(state==='pick') drawPick();
+    if(state==='dead') overlay('BUSTED','手配度 ★'+wanted()+' / 生存 '+Math.floor(t)+'秒 / 撃破 '+kills+'\n\nEnter / クリック / タップでリトライ','#ef4444');
+    if(state==='clear') overlay('ESCAPED!','15分間逃げ切った！ 撃破 '+kills+' / Lv'+p.lvl+'\n\nEnter / クリック / タップでもう一度','#4ade80');
+  }
+  requestAnimationFrame(loop);
+}
+addEventListener('keydown',e=>{ keys[e.key.toLowerCase()]=true; if(e.key===' ')e.preventDefault();
+  if(e.key==='Enter'&&(state==='title'||state==='dead'||state==='clear')) start();
+  if(state==='pick'&&['1','2','3'].includes(e.key)) applyPick(choices[+e.key-1]); });
+addEventListener('keyup',e=>keys[e.key.toLowerCase()]=false);
+
+/* ========== スマホ操作 ==========
+   左スティック: 移動 / 右スティック: 照準+射撃(倒している間は自動連射) / DASHボタン */
+const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints>0;
+const TS = { l:null, r:null, dashId:null };
+const STICK_R = 55;
+let touchMode=false, pickT=0, prevState='', stT=0;
+const dashBtn = () => ({ x:W-70, y:H-190, r:44 });
+function stickVec(s){ if(!s) return null; const dx=s.x-s.ox, dy=s.y-s.oy, l=Math.hypot(dx,dy); return { x:l?dx/l:0, y:l?dy/l:0, m:Math.min(1,l/STICK_R) }; }
+function pickAt(x,y){
+  if(performance.now()-pickT<400) return;          // 誤タップ防止
+  for(let i=0;i<3;i++){ const c=cardRect(i); if(x>c.x&&x<c.x+c.w&&y>c.y&&y<c.y+c.h){ applyPick(choices[i]); return; } }
+}
+function tstart(e){
+  e.preventDefault(); touchMode=true;
+  for(const c of e.changedTouches){
+    const x=c.clientX, y=c.clientY;
+    if(state==='pick'){ pickAt(x,y); continue; }
+    if(state!=='play'){ if(performance.now()-stT>700) start(); continue; }
+    const b=dashBtn();
+    if(Math.hypot(x-b.x,y-b.y)<b.r+12){ TS.dashId=c.identifier; continue; }
+    const st={ id:c.identifier, ox:x, oy:y, x, y };
+    if(x<W/2){ if(!TS.l) TS.l=st; } else if(!TS.r) TS.r=st;
+  }
+}
+function tmove(e){
+  e.preventDefault();
+  for(const c of e.changedTouches) for(const k of ['l','r']){
+    const st=TS[k]; if(!st||st.id!==c.identifier) continue;
+    st.x=c.clientX; st.y=c.clientY;
+    const dx=st.x-st.ox, dy=st.y-st.oy, l=Math.hypot(dx,dy);
+    if(l>STICK_R){ st.ox=st.x-dx/l*STICK_R; st.oy=st.y-dy/l*STICK_R; }   // 土台が指に追従
+  }
+}
+function tend(e){
+  e.preventDefault();
+  for(const c of e.changedTouches){
+    if(TS.l&&TS.l.id===c.identifier) TS.l=null;
+    if(TS.r&&TS.r.id===c.identifier) TS.r=null;
+    if(TS.dashId===c.identifier) TS.dashId=null;
+  }
+}
+cv.addEventListener('touchstart',tstart,{passive:false});
+cv.addEventListener('touchmove',tmove,{passive:false});
+cv.addEventListener('touchend',tend,{passive:false});
+cv.addEventListener('touchcancel',tend,{passive:false});
+function drawTouchUI(){
+  if(state!=='play') return;
+  const b=dashBtn();
+  ctx.lineWidth=3; ctx.fillStyle=p.dashCd>0?'#33333388':'#f59e0b99'; ctx.strokeStyle='#ffffff99';
+  ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,7); ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#fff'; ctx.font='bold 14px sans-serif'; ctx.textAlign='center'; ctx.fillText('DASH',b.x,b.y+5);
+  ctx.fillStyle='#ffffff66'; ctx.font='13px sans-serif';
+  if(!TS.l) ctx.fillText('左: 移動',W*0.18,H-24);
+  if(!TS.r) ctx.fillText('右: 照準+射撃',W*0.68,H-24);
+  for(const st of [TS.l,TS.r]){ if(!st) continue;
+    ctx.strokeStyle='#ffffff88'; ctx.fillStyle='#ffffff22'; ctx.beginPath(); ctx.arc(st.ox,st.oy,STICK_R,0,7); ctx.fill(); ctx.stroke();
+    ctx.fillStyle=st===TS.r?'#ef444499':'#ffffff99'; ctx.beginPath(); ctx.arc(st.x,st.y,22,0,7); ctx.fill(); }
+  ctx.textAlign='left';
+}
+cv.addEventListener('mousemove',e=>{ mouse.x=e.clientX; mouse.y=e.clientY; touchMode=false; });
+cv.addEventListener('mousedown',e=>{ mouse.down=true; mouse.x=e.clientX; mouse.y=e.clientY; if(state==='pick'){ pickAt(mouse.x,mouse.y); mouse.down=false; return; }
+  if(state!=='play') start(); });
+addEventListener('mouseup',()=>mouse.down=false);
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+last=performance.now(); requestAnimationFrame(loop);
+</script>
+</body>
+</html>
